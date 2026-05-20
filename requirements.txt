@@ -1,0 +1,12 @@
+# 极简全能持续运行Agent - 依赖
+
+# 核心依赖 (Python标准库,无需安装)
+# sqlite3, json, threading, queue, subprocess, signal, logging
+
+# 可选依赖
+psutil>=5.9.0  # 系统资源监控 (可选,用于更精确的内存/CPU监控)
+
+# 开发依赖
+# pytest>=7.0.0  # 测试框架
+# black>=23.0.0  # 代码格式化
+# mypy>=1.0.0    # 类型检查
