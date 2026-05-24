@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 import logging
+from collections import deque
+from core.knowledge_graph import Experience
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     RETRYING = "retrying"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -56,6 +60,8 @@ class Task:
     error: Optional[str] = None
     retry_count: int = 0
     related_experiences: List[str] = field(default_factory=list)
+    max_retries: int = 3  # 最大重试次数
+    timeout_seconds: int = 300  # 任务超时时间(秒)
 
 
 @dataclass
@@ -92,20 +98,36 @@ class CodeAnalyzer:
         if not result["exists"]:
             return result
         
+        # 尝试多种编码读取文件
+        content = None
+        encodings = ['utf-8', 'gbk', 'latin-1']
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        content = f.read()
+                    break
+                except UnicodeDecodeError:
+                    continue
+        except Exception as e:
+            result["issues"].append(f"分析错误: {str(e)}")
+            return result
+
+        if content is None:
+            result["issues"].append("分析错误: 无法识别文件编码")
+            return result
+
+        try:
             result["size"] = len(content)
             result["lines"] = content.count('\n') + 1
-            
+
             # Python文件AST分析
             if file_path.endswith('.py'):
                 result.update(CodeAnalyzer._analyze_python(content))
             # JavaScript/TypeScript分析
             elif file_path.endswith(('.js', '.ts', '.jsx', '.tsx')):
                 result.update(CodeAnalyzer._analyze_javascript(content))
-            
+
         except Exception as e:
             result["issues"].append(f"分析错误: {str(e)}")
         
@@ -124,7 +146,7 @@ class CodeAnalyzer:
         
         try:
             tree = ast.parse(content)
-            
+
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     result["functions"].append({
@@ -134,7 +156,7 @@ class CodeAnalyzer:
                         "docstring": ast.get_docstring(node) or ""
                     })
                     result["complexity"] += 1
-                
+
                 elif isinstance(node, ast.ClassDef):
                     methods = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
                     result["classes"].append({
@@ -143,7 +165,7 @@ class CodeAnalyzer:
                         "methods": methods
                     })
                     result["complexity"] += len(methods)
-                
+
                 elif isinstance(node, (ast.Import, ast.ImportFrom)):
                     if isinstance(node, ast.Import):
                         for alias in node.names:
@@ -152,12 +174,16 @@ class CodeAnalyzer:
                         module = node.module or ""
                         for alias in node.names:
                             result["imports"].append(f"{module}.{alias.name}" if module else alias.name)
-            
+
             # 检测常见问题
             result["issues"].extend(CodeAnalyzer._detect_python_issues(content, tree))
-            
+
         except SyntaxError as e:
             result["issues"].append(f"语法错误: {e.msg} (行 {e.lineno})")
+        except MemoryError:
+            result["issues"].append("解析错误: 文件过大导致内存不足")
+        except RecursionError:
+            result["issues"].append("解析错误: 代码结构过于复杂导致递归深度超限")
         except Exception as e:
             result["issues"].append(f"解析错误: {str(e)}")
         
@@ -167,16 +193,6 @@ class CodeAnalyzer:
     def _detect_python_issues(content: str, tree: ast.AST) -> List[str]:
         """检测Python代码问题"""
         issues = []
-        
-        # 检测未使用的导入(简化版)
-        imports = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.add(alias.name.split('.')[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.add(node.module.split('.')[0])
         
         # 检测长函数
         for node in ast.walk(tree):
@@ -488,9 +504,9 @@ class TaskExecutor:
         self.work_dir = Path(work_dir)
         self.task_queue = queue.PriorityQueue()
         self.active_tasks: Dict[str, Task] = {}
-        self.completed_tasks: List[Task] = []
+        self.completed_tasks: deque = deque(maxlen=1000)
         self._lock = threading.RLock()
-        self._running = False
+        self._running = threading.Event()
         self._workers: List[threading.Thread] = []
         
         # 注册任务处理器
@@ -503,6 +519,24 @@ class TaskExecutor:
             TaskType.TEST: self._handle_test,
         }
     
+    def _resolve_safe_path(self, file_path: str):
+        """安全地解析文件路径，防止路径遍历攻击"""
+        try:
+            if os.path.isabs(file_path):
+                full_path = Path(file_path).resolve()
+            else:
+                full_path = (self.work_dir / file_path).resolve()
+            work_dir_resolved = self.work_dir.resolve()
+            try:
+                full_path.relative_to(work_dir_resolved)
+                return str(full_path)
+            except ValueError:
+                logger.warning(f"路径遍历尝试被阻止: {file_path}")
+                return None
+        except (OSError, ValueError) as e:
+            logger.warning(f"路径解析失败: {file_path}, 错误: {e}")
+            return None
+
     def submit_task(self, task: Task) -> str:
         """提交任务"""
         with self._lock:
@@ -520,7 +554,11 @@ class TaskExecutor:
     
     def start(self, num_workers: int = 2):
         """启动执行器"""
-        self._running = True
+        with self._lock:
+            if self._running.is_set():
+                logger.warning("执行器已在运行")
+                return
+            self._running.set()
         for i in range(num_workers):
             worker = threading.Thread(target=self._worker_loop, name=f"Worker-{i}")
             worker.daemon = True
@@ -530,14 +568,43 @@ class TaskExecutor:
     
     def stop(self):
         """停止执行器"""
-        self._running = False
+        with self._lock:
+            if not self._running.is_set():
+                logger.warning("执行器未在运行")
+                return
+            self._running.clear()
+
+        # 等待工作线程结束
         for worker in self._workers:
             worker.join(timeout=5)
+
+        with self._lock:
+            # 清空队列
+            while not self.task_queue.empty():
+                try:
+                    self.task_queue.get_nowait()
+                    self.task_queue.task_done()
+                except queue.Empty:
+                    break
+
+            # 将未执行任务标记为取消，将RUNNING任务标记为FAILED
+            for task_id, task in list(self.active_tasks.items()):
+                if task.status == TaskStatus.RUNNING:
+                    task.status = TaskStatus.FAILED
+                    task.error = "执行器停止，任务被强制终止"
+                elif task.status == TaskStatus.PENDING:
+                    task.status = TaskStatus.FAILED
+                    task.error = "执行器停止，任务被取消"
+                self.completed_tasks.append(task)
+
+            self.active_tasks.clear()
+            self._workers.clear()
+
         logger.info("执行器已停止")
     
     def _worker_loop(self):
         """工作线程主循环"""
-        while self._running:
+        while self._running.is_set():
             try:
                 # 获取任务(带超时)
                 try:
@@ -545,31 +612,32 @@ class TaskExecutor:
                 except queue.Empty:
                     continue
                 
-                with self._lock:
-                    task = self.active_tasks.get(task_id)
-                    if not task:
-                        continue
+                try:
+                    with self._lock:
+                        task = self.active_tasks.get(task_id)
+                        if not task:
+                            continue
+                        
+                        task.status = TaskStatus.RUNNING
+                        task.started_at = datetime.now().isoformat()
                     
-                    task.status = TaskStatus.RUNNING
-                    task.started_at = datetime.now().isoformat()
-                
-                # 执行任务
-                result = self._execute_task(task)
-                
-                # 更新任务状态
-                with self._lock:
-                    task.status = TaskStatus.COMPLETED if result.success else TaskStatus.FAILED
-                    task.completed_at = datetime.now().isoformat()
-                    task.result = result.__dict__
+                    # 执行任务
+                    result = self._execute_task(task)
                     
-                    if not result.success:
-                        task.error = result.output
-                    
-                    self.completed_tasks.append(task)
-                    if task.id in self.active_tasks:
-                        del self.active_tasks[task.id]
-                
-                self.task_queue.task_done()
+                    # 更新任务状态
+                    with self._lock:
+                        task.status = TaskStatus.COMPLETED if result.success else TaskStatus.FAILED
+                        task.completed_at = datetime.now().isoformat()
+                        task.result = result.__dict__
+                        
+                        if not result.success:
+                            task.error = result.output
+                        
+                        self.completed_tasks.append(task)
+                        if task.id in self.active_tasks:
+                            del self.active_tasks[task.id]
+                finally:
+                    self.task_queue.task_done()
                 
             except Exception as e:
                 logger.error(f"工作线程异常: {traceback.format_exc()}")
@@ -618,19 +686,33 @@ class TaskExecutor:
     
     def _handle_analyze(self, task: Task) -> ExecutionResult:
         """处理代码分析任务"""
+        if not task.target_files:
+            return ExecutionResult(
+                success=False,
+                task_id=task.id,
+                output="未指定目标文件",
+                changes=[],
+                issues_found=[],
+                suggestions=[],
+                execution_time=0
+            )
+
         results = []
         issues = []
         suggestions = []
         
         for file_path in task.target_files:
-            full_path = self.work_dir / file_path if not os.path.isabs(file_path) else file_path
-            
+            full_path = self._resolve_safe_path(file_path)
+            if full_path is None:
+                issues.append({"file": file_path, "type": "path_traversal", "message": f"路径遍历尝试被阻止: {file_path}", "severity": "high"})
+                continue
+
             # 分析文件
-            analysis = CodeAnalyzer.analyze_file(str(full_path))
+            analysis = CodeAnalyzer.analyze_file(full_path)
             results.append(analysis)
-            
+
             # 检测Bug
-            bugs = CodeAnalyzer.detect_bugs(str(full_path))
+            bugs = CodeAnalyzer.detect_bugs(full_path)
             issues.extend(bugs)
             
             # 生成建议
@@ -650,21 +732,41 @@ class TaskExecutor:
             output=output,
             changes=[],
             issues_found=issues,
-            suggestions=suggestions
+            suggestions=suggestions,
+            execution_time=0
         )
     
     def _handle_bug_fix(self, task: Task) -> ExecutionResult:
         """处理Bug修复任务"""
+        if not task.target_files:
+            return ExecutionResult(
+                success=False,
+                task_id=task.id,
+                output="未指定目标文件",
+                changes=[],
+                issues_found=[],
+                suggestions=[],
+                execution_time=0
+            )
+
         # 先分析问题
         issues = []
         changes = []
+        files_processed = 0
         
         for file_path in task.target_files:
-            full_path = self.work_dir / file_path if not os.path.isabs(file_path) else file_path
-            
+            full_path = self._resolve_safe_path(file_path)
+            if full_path is None:
+                issues.append({"file": file_path, "type": "path_traversal", "message": f"路径遍历尝试被阻止: {file_path}", "severity": "high"})
+                continue
+
+            if not os.path.exists(full_path):
+                continue
+
             # 检测Bug
-            bugs = CodeAnalyzer.detect_bugs(str(full_path))
+            bugs = CodeAnalyzer.detect_bugs(full_path)
             issues.extend(bugs)
+            files_processed += 1
             
             # 查找相关经验
             similar = self.kg.get_similar_experiences(task.description)
@@ -679,40 +781,58 @@ class TaskExecutor:
         output = f"检测到 {len(issues)} 个潜在Bug\n"
         output += "建议检查以下问题:\n" + "\n".join(suggestions) if suggestions else "未发现明显Bug模式"
         
+        if files_processed == 0:
+            return ExecutionResult(
+                success=False,
+                task_id=task.id,
+                output="所有目标文件均不存在",
+                changes=changes,
+                issues_found=issues,
+                suggestions=suggestions,
+                execution_time=0
+            )
+        
         return ExecutionResult(
             success=True,
             task_id=task.id,
             output=output,
             changes=changes,
             issues_found=issues,
-            suggestions=suggestions
+            suggestions=suggestions,
+            execution_time=0
         )
     
     def _handle_refactor(self, task: Task) -> ExecutionResult:
         """处理重构任务"""
+        if not task.target_files:
+            return ExecutionResult(
+                success=False,
+                task_id=task.id,
+                output="未指定目标文件",
+                changes=[],
+                issues_found=[],
+                suggestions=[],
+                execution_time=0
+            )
+
         suggestions = []
         changes = []
         
         for file_path in task.target_files:
-            full_path = self.work_dir / file_path if not os.path.isabs(file_path) else file_path
-            analysis = CodeAnalyzer.analyze_file(str(full_path))
+            full_path = self._resolve_safe_path(file_path)
+            if full_path is None:
+                suggestions.append(f"{file_path}: 路径遍历尝试被阻止")
+                continue
+            analysis = CodeAnalyzer.analyze_file(full_path)
             
             # 重构建议
             if analysis.get("complexity", 0) > 15:
-                suggestions.append({
-                    "file": file_path,
-                    "type": "reduce_complexity",
-                    "message": "考虑将复杂函数拆分为更小的函数"
-                })
+                suggestions.append(f"{file_path}: 考虑将复杂函数拆分为更小的函数")
             
             # 检查函数长度
             for func in analysis.get("functions", []):
                 if func.get("docstring") == "":
-                    suggestions.append({
-                        "file": file_path,
-                        "type": "add_docstring",
-                        "message": f"函数 {func['name']} 缺少文档字符串"
-                    })
+                    suggestions.append(f"{file_path}: 函数 {func['name']} 缺少文档字符串")
         
         output = f"生成了 {len(suggestions)} 条重构建议"
         
@@ -722,31 +842,39 @@ class TaskExecutor:
             output=output,
             changes=changes,
             issues_found=[],
-            suggestions=[s["message"] for s in suggestions]
+            suggestions=suggestions,
+            execution_time=0
         )
     
     def _handle_implement(self, task: Task) -> ExecutionResult:
         """处理实现任务"""
-        # 查找相关经验
-        similar = self.kg.get_similar_experiences(task.description)
-        
         suggestions = []
-        if similar:
-            for exp, score in similar[:3]:
-                suggestions.append(f"参考经验 {exp.id}: {exp.solution[:100]}...")
-        
+        similar = []
+
+        # 知识图谱查询是可选依赖，失败时不应导致任务失败
+        try:
+            similar = self.kg.get_similar_experiences(task.description)
+            if similar:
+                for exp, score in similar[:3]:
+                    suggestions.append(f"参考经验 {exp.id}: {(exp.solution or '')[:100]}...")
+        except Exception as e:
+            # 知识图谱查询失败，记录警告但继续执行任务
+            logger.warning(f"知识图谱查询失败: {str(e)}")
+            suggestions.append(f"[警告] 知识图谱查询失败: {str(e)}")
+
         output = f"实现任务: {task.description}\n"
         output += f"找到 {len(similar)} 条相关经验\n"
         if suggestions:
             output += "参考建议:\n" + "\n".join(suggestions)
-        
+
         return ExecutionResult(
             success=True,
             task_id=task.id,
             output=output,
             changes=[],
             issues_found=[],
-            suggestions=suggestions
+            suggestions=suggestions,
+            execution_time=0
         )
     
     def _handle_optimize(self, task: Task) -> ExecutionResult:
@@ -754,8 +882,11 @@ class TaskExecutor:
         suggestions = []
         
         for file_path in task.target_files:
-            full_path = self.work_dir / file_path if not os.path.isabs(file_path) else file_path
-            analysis = CodeAnalyzer.analyze_file(str(full_path))
+            full_path = self._resolve_safe_path(file_path)
+            if full_path is None:
+                suggestions.append(f"{file_path}: 路径遍历尝试被阻止")
+                continue
+            analysis = CodeAnalyzer.analyze_file(full_path)
             
             # 性能优化建议
             if file_path.endswith('.py'):
@@ -770,7 +901,8 @@ class TaskExecutor:
             output=f"生成了 {len(suggestions)} 条优化建议",
             changes=[],
             issues_found=[],
-            suggestions=suggestions
+            suggestions=suggestions,
+            execution_time=0
         )
     
     def _handle_test(self, task: Task) -> ExecutionResult:
@@ -778,7 +910,15 @@ class TaskExecutor:
         results = []
         
         for file_path in task.target_files:
-            full_path = self.work_dir / file_path if not os.path.isabs(file_path) else file_path
+            full_path = self._resolve_safe_path(file_path)
+            if full_path is None:
+                results.append({
+                    "file": file_path,
+                    "test_file": None,
+                    "passed": None,
+                    "output": "路径遍历尝试被阻止"
+                })
+                continue
             
             # 检查是否存在测试文件
             test_file = self._find_test_file(file_path)
@@ -823,7 +963,8 @@ class TaskExecutor:
             output=output,
             changes=[],
             issues_found=[],
-            suggestions=[]
+            suggestions=[],
+            execution_time=0
         )
     
     def _find_test_file(self, source_file: str) -> Optional[str]:
@@ -845,8 +986,6 @@ class TaskExecutor:
     
     def _record_experience(self, task: Task, result: ExecutionResult) -> str:
         """记录经验到知识图谱"""
-        from core.knowledge_graph import Experience
-        
         experience = Experience(
             id=self._generate_exp_id(task),
             task_type=task.task_type.value,
@@ -887,7 +1026,7 @@ class TaskExecutor:
         """获取执行器状态"""
         with self._lock:
             return {
-                "running": self._running,
+                "running": self._running.is_set(),
                 "active_tasks": len(self.active_tasks),
                 "queued_tasks": self.task_queue.qsize(),
                 "completed_tasks": len(self.completed_tasks),

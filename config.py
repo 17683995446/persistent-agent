@@ -5,13 +5,24 @@ import os
 from pathlib import Path
 
 # 基础路径
-BASE_DIR = Path(__file__).parent.absolute()
+# [Bug C-007] 在某些打包环境或交互式环境中`__file__`不可用时的降级处理
+BASE_DIR = Path(__file__).parent.absolute() if '__file__' in dir() else Path.cwd()
 KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 LOG_DIR = BASE_DIR / "logs"
 
 # 确保目录存在
-KNOWLEDGE_BASE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# [Bug#129] 用try/except包裹目录创建，防止在不可写环境中导入失败
+try:
+    # 检查路径是否是已存在的文件而非目录
+    if KNOWLEDGE_BASE_DIR.exists() and not KNOWLEDGE_BASE_DIR.is_dir():
+        raise NotADirectoryError(f"路径已存在但不是目录: {KNOWLEDGE_BASE_DIR}")
+    if LOG_DIR.exists() and not LOG_DIR.is_dir():
+        raise NotADirectoryError(f"路径已存在但不是目录: {LOG_DIR}")
+    KNOWLEDGE_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    import warnings
+    warnings.warn(f"无法创建必要目录: {e}。部分功能可能不可用。")
 
 # 知识图谱配置
 KNOWLEDGE_GRAPH_DB = str(KNOWLEDGE_BASE_DIR / "knowledge.db")
